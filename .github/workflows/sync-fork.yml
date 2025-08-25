@@ -20,7 +20,7 @@ on:
     - cron: '0 2 * * *'
 
 env:
-  UPSTREAM_REPO: 'original-org/langconnect'  # Replace with actual upstream repo
+  UPSTREAM_REPO: 'langchain-ai/langconnect'
   UPSTREAM_BRANCH: ${{ github.event.inputs.upstream_branch || 'main' }}
 
 jobs:
