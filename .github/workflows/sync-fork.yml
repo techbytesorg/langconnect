@@ -1,0 +1,229 @@
+name: Sync Fork and Deploy
+
+on:
+  # Manual trigger to sync with upstream
+  workflow_dispatch:
+    inputs:
+      upstream_branch:
+        description: 'Upstream branch to sync from'
+        required: true
+        default: 'main'
+        type: string
+      force_sync:
+        description: 'Force sync even if there are conflicts'
+        required: false
+        default: false
+        type: boolean
+  
+  # Scheduled sync check (runs at 2 AM UTC daily)
+  schedule:
+    - cron: '0 2 * * *'
+
+env:
+  UPSTREAM_REPO: 'original-org/langconnect'  # Replace with actual upstream repo
+  UPSTREAM_BRANCH: ${{ github.event.inputs.upstream_branch || 'main' }}
+
+jobs:
+  check-sync:
+    name: Check for Upstream Changes
+    runs-on: ubuntu-latest
+    outputs:
+      needs-sync: ${{ steps.compare.outputs.needs-sync }}
+      upstream-commits: ${{ steps.compare.outputs.upstream-commits }}
+    
+    steps:
+    - name: Checkout fork
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        token: ${{ secrets.GITHUB_TOKEN }}
+        
+    - name: Configure git
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        
+    - name: Add upstream remote
+      run: |
+        git remote add upstream https://github.com/${{ env.UPSTREAM_REPO }}.git
+        git fetch upstream ${{ env.UPSTREAM_BRANCH }}
+        
+    - name: Compare with upstream
+      id: compare
+      run: |
+        # Check if there are new commits in upstream
+        UPSTREAM_HASH=$(git rev-parse upstream/${{ env.UPSTREAM_BRANCH }})
+        LOCAL_HASH=$(git rev-parse origin/${{ env.UPSTREAM_BRANCH }})
+        
+        echo "Upstream: $UPSTREAM_HASH"
+        echo "Local: $LOCAL_HASH"
+        
+        if [ "$UPSTREAM_HASH" != "$LOCAL_HASH" ]; then
+          echo "needs-sync=true" >> $GITHUB_OUTPUT
+          
+          # Get list of new commits
+          COMMITS=$(git log --oneline $LOCAL_HASH..$UPSTREAM_HASH | head -10)
+          echo "New commits found:"
+          echo "$COMMITS"
+          
+          # Escape newlines for output
+          COMMITS_ESCAPED=$(echo "$COMMITS" | sed ':a;N;$!ba;s/\n/\\n/g')
+          echo "upstream-commits=$COMMITS_ESCAPED" >> $GITHUB_OUTPUT
+        else
+          echo "needs-sync=false" >> $GITHUB_OUTPUT
+          echo "Fork is up to date with upstream"
+        fi
+
+  sync-fork:
+    name: Sync Fork with Upstream
+    runs-on: ubuntu-latest
+    needs: check-sync
+    if: needs.check-sync.outputs.needs-sync == 'true' || github.event.inputs.force_sync == 'true'
+    
+    steps:
+    - name: Checkout fork
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        token: ${{ secrets.GITHUB_TOKEN }}
+        
+    - name: Configure git
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        
+    - name: Add upstream remote and sync
+      run: |
+        git remote add upstream https://github.com/${{ env.UPSTREAM_REPO }}.git
+        git fetch upstream ${{ env.UPSTREAM_BRANCH }}
+        
+        # Attempt merge
+        echo "Attempting to merge upstream/${{ env.UPSTREAM_BRANCH }} into ${{ env.UPSTREAM_BRANCH }}"
+        
+        if git merge upstream/${{ env.UPSTREAM_BRANCH }} --no-edit; then
+          echo "✅ Merge successful"
+          echo "SYNC_STATUS=success" >> $GITHUB_ENV
+        else
+          echo "⚠️  Merge conflicts detected"
+          echo "SYNC_STATUS=conflict" >> $GITHUB_ENV
+          
+          # Show conflicts
+          echo "Conflicted files:"
+          git status --porcelain | grep "^UU"
+          
+          if [ "${{ github.event.inputs.force_sync }}" == "true" ]; then
+            echo "Force sync enabled - resolving conflicts by accepting upstream"
+            git checkout --theirs .
+            git add .
+            git commit --no-edit
+            echo "SYNC_STATUS=force-resolved" >> $GITHUB_ENV
+          else
+            # Abort merge and exit
+            git merge --abort
+            echo "SYNC_STATUS=aborted" >> $GITHUB_ENV
+            exit 1
+          fi
+        fi
+        
+    - name: Push synchronized changes
+      if: env.SYNC_STATUS != 'aborted'
+      run: |
+        git push origin ${{ env.UPSTREAM_BRANCH }}
+        echo "✅ Fork synchronized with upstream"
+        
+    - name: Create sync summary
+      run: |
+        echo "## 🔄 Fork Sync Results" >> $GITHUB_STEP_SUMMARY
+        echo "- **Upstream Repository**: ${{ env.UPSTREAM_REPO }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Upstream Branch**: ${{ env.UPSTREAM_BRANCH }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Sync Status**: ${{ env.SYNC_STATUS }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Synced at**: $(date -u)" >> $GITHUB_STEP_SUMMARY
+        
+        if [ "${{ env.SYNC_STATUS }}" == "success" ] || [ "${{ env.SYNC_STATUS }}" == "force-resolved" ]; then
+          echo "- **New Commits**: " >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "${{ needs.check-sync.outputs.upstream-commits }}" >> $GITHUB_STEP_SUMMARY  
+          echo '```' >> $GITHUB_STEP_SUMMARY
+        fi
+
+  trigger-build-after-sync:
+    name: Trigger Container Build After Sync
+    runs-on: ubuntu-latest
+    needs: [check-sync, sync-fork]
+    if: needs.sync-fork.result == 'success'
+    
+    steps:
+    - name: Trigger build workflow
+      uses: peter-evans/repository-dispatch@v3
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        repository: ${{ github.repository }}
+        event-type: sync-complete
+        client-payload: |
+          {
+            "sync_reason": "upstream_sync",
+            "upstream_commits": "${{ needs.check-sync.outputs.upstream-commits }}",
+            "sync_time": "${{ steps.sync.outputs.sync_time }}"
+          }
+          
+    - name: Sync completion summary
+      run: |
+        echo "## ✅ Fork Sync and Build Triggered" >> $GITHUB_STEP_SUMMARY
+        echo "- **Sync Status**: Successful" >> $GITHUB_STEP_SUMMARY
+        echo "- **Build Triggered**: ✅" >> $GITHUB_STEP_SUMMARY
+        echo "- **Next Steps**: Container will be built and deployed automatically" >> $GITHUB_STEP_SUMMARY
+
+  handle-sync-conflicts:
+    name: Handle Sync Conflicts
+    runs-on: ubuntu-latest
+    needs: sync-fork
+    if: needs.sync-fork.result == 'failure'
+    
+    steps:
+    - name: Create conflict issue
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const title = '🚨 Fork Sync Conflict - Manual Resolution Required';
+          const body = `
+          ## Fork Sync Conflict Detected
+          
+          **Upstream Repository**: ${{ env.UPSTREAM_REPO }}
+          **Branch**: ${{ env.UPSTREAM_BRANCH }}
+          **Conflict Time**: ${new Date().toISOString()}
+          
+          ### New Upstream Commits:
+          \`\`\`
+          ${{ needs.check-sync.outputs.upstream-commits }}
+          \`\`\`
+          
+          ### Resolution Steps:
+          1. Manually resolve conflicts locally:
+             \`\`\`bash
+             git fetch upstream main
+             git merge upstream/main
+             # Resolve conflicts manually
+             git commit
+             git push
+             \`\`\`
+          
+          2. Or trigger force sync via workflow dispatch if conflicts are acceptable
+          
+          ### Auto-generated Issue
+          This issue was created automatically by the fork sync workflow.
+          `;
+          
+          github.rest.issues.create({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            title: title,
+            body: body,
+            labels: ['sync-conflict', 'manual-intervention-required']
+          });
+          
+    - name: Conflict summary
+      run: |
+        echo "## ⚠️  Fork Sync Failed - Conflicts Detected" >> $GITHUB_STEP_SUMMARY
+        echo "- **Status**: Manual resolution required" >> $GITHUB_STEP_SUMMARY
+        echo "- **Issue Created**: ✅" >> $GITHUB_STEP_SUMMARY
+        echo "- **Action Required**: Check repository issues for resolution steps" >> $GITHUB_STEP_SUMMARY

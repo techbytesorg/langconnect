@@ -1,0 +1,132 @@
+name: Build and Push LangConnect Container
+
+on:
+  push:
+    branches: [ main, test-ci-cd-pipeline ]
+  pull_request:
+    branches: [ main ]
+  repository_dispatch:
+    types: [sync-complete]
+  workflow_dispatch:
+    inputs:
+      test_mode:
+        description: 'Run in test mode (no ECR push, no webhook trigger)'
+        required: true
+        default: true
+        type: boolean
+
+env:
+  AWS_REGION: us-west-2
+  ENVIRONMENT: dev
+  ECR_REPOSITORY: m2m/dev/oap/langconnect
+  TEST_MODE: ${{ github.event.inputs.test_mode || 'false' }}
+
+jobs:
+  build:
+    name: Build Container Image
+    runs-on: ubuntu-latest
+    
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.build.outputs.digest }}
+    
+    steps:
+    - name: Checkout application code
+      uses: actions/checkout@v4
+      
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+        
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+      
+    - name: Extract metadata for Docker
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=raw,value={{date 'YYYYMMDD-HHMMSS'}}-{{sha}}
+          type=raw,value=latest,enable={{is_default_branch}}
+          
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      
+    - name: Build and push Docker image
+      id: build
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        platforms: linux/amd64
+        push: ${{ env.TEST_MODE != 'true' }}  # Skip push in test mode
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        
+    - name: Test mode summary
+      if: env.TEST_MODE == 'true'
+      run: |
+        echo "🧪 TEST MODE: Container built but not pushed to ECR"
+        echo "Tags that would be pushed: ${{ steps.meta.outputs.tags }}"
+        
+    - name: Run container security scan
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+        
+    - name: Upload Trivy scan results to GitHub Security tab
+      uses: github/codeql-action/upload-sarif@v2
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
+        
+  trigger-deployment:
+    name: Trigger Infrastructure Deployment
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push' && github.event.inputs.test_mode != 'true'
+    
+    steps:
+    - name: Extract image tag from metadata
+      id: extract-tag
+      run: |
+        # Extract the timestamped tag (format: YYYYMMDD-HHMMSS-commit)
+        FULL_TAGS="${{ needs.build.outputs.image-tag }}"
+        IMAGE_TAG=$(echo "$FULL_TAGS" | grep -o '[0-9]\{8\}-[0-9]\{6\}-[a-f0-9]\{7\}' | head -1)
+        echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_OUTPUT
+        echo "Extracted image tag: $IMAGE_TAG"
+        
+    - name: Trigger infrastructure deployment
+      uses: peter-evans/repository-dispatch@v3
+      with:
+        token: ${{ secrets.INFRA_REPO_DISPATCH_TOKEN }}
+        repository: ${{ secrets.INFRA_REPO_NAME }}  # e.g., "your-org/langconnect_infra"
+        event-type: new-container-ready
+        client-payload: |
+          {
+            "image_tag": "${{ steps.extract-tag.outputs.IMAGE_TAG }}",
+            "environment": "dev",
+            "app_commit": "${{ github.sha }}",
+            "app_ref": "${{ github.ref }}",
+            "triggered_by": "${{ github.actor }}",
+            "trigger_reason": "New app version built from main branch"
+          }
+          
+    - name: Build Summary
+      run: |
+        echo "## 🚀 Container Build Successful" >> $GITHUB_STEP_SUMMARY
+        echo "- **Image Tag**: ${{ steps.extract-tag.outputs.IMAGE_TAG }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Registry**: ${{ env.ECR_REPOSITORY }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Triggered Deployment**: ✅" >> $GITHUB_STEP_SUMMARY
+        echo "- **Built at**: $(date -u)" >> $GITHUB_STEP_SUMMARY
